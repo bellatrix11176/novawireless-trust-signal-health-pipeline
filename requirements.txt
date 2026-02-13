@@ -1,0 +1,10 @@
+# NovaWireless Trust Signals (Trust Signal Health Framework)
+# Core data + NLP tooling
+
+pandas
+numpy
+scikit-learn
+joblib
+pyarrow
+tabulate
+matplotlib
