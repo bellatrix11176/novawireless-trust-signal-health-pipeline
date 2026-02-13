@@ -19,9 +19,20 @@ Writes:
 - /output/integrity_flags.csv
 - /output/integrity_summary.json
 
+Duplicate handling (--dupe_policy):
+- quarantine_all (default):
+    Flag and quarantine ALL rows that are part of a duplicated interaction_id group.
+- quarantine_extras_keep_latest:
+    Keep ONE row per duplicated interaction_id (the latest by timestamp),
+    quarantine ONLY the extra rows.
+- quarantine_extras_keep_first:
+    Keep ONE row per duplicated interaction_id (the first by timestamp),
+    quarantine ONLY the extra rows.
+
 Usage:
   python src/control_layer/integrity_control_layer.py
   python src/control_layer/integrity_control_layer.py --file novawireless_synthetic_calls.csv
+  python src/control_layer/integrity_control_layer.py --dupe_policy quarantine_extras_keep_latest
   python src/control_layer/integrity_control_layer.py --crt_min 0 --crt_max 21600
 """
 
@@ -32,7 +43,7 @@ import json
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -151,10 +162,19 @@ class IntegrityConfig:
     crt_max_seconds: float = 6 * 60 * 60  # 6 hours
 
 
+def _valid_key_mask(series: pd.Series) -> pd.Series:
+    """
+    Defines which keys are considered "valid" (counted for duplicate detection).
+    Missing-like keys are ignored for dupe logic.
+    """
+    s = series.astype(str).str.strip()
+    missing_like = {"", "nan", "none", "null", "UNKNOWN", "N/A"}
+    return ~s.str.lower().isin({m.lower() for m in missing_like})
+
+
 def build_flags(df: pd.DataFrame, cfg: IntegrityConfig) -> pd.DataFrame:
     """
-    Return a flags DataFrame with one row per record.
-    Columns begin with 'flag_' and can be OR'ed into a master any_flag.
+    Base integrity flags (excluding dupe_policy resolution).
     """
     flags = pd.DataFrame(index=df.index)
 
@@ -173,23 +193,6 @@ def build_flags(df: pd.DataFrame, cfg: IntegrityConfig) -> pd.DataFrame:
     if cfg.timestamp_col in df.columns:
         flags["flag_bad_timestamp_parse"] = df[cfg.timestamp_col].isna()
 
-    # Duplicate interaction_id (ONLY among valid keys)
-    if cfg.unique_key in df.columns:
-        key = df[cfg.unique_key].astype(str).str.strip()
-
-        # Treat these as "missing" keys (do NOT count them in duplicate logic)
-        missing_like = {"", "nan", "none", "null", "UNKNOWN", "N/A"}
-
-        key_valid = ~key.str.lower().isin({m.lower() for m in missing_like})
-
-        dup_valid = pd.Series(False, index=df.index)
-        if key_valid.any():
-            dup_valid.loc[key_valid] = df.loc[key_valid].duplicated(subset=[cfg.unique_key], keep=False)
-
-        flags["flag_duplicate_interaction_id"] = dup_valid
-    else:
-        flags["flag_duplicate_interaction_id"] = False
-
     # Binary-like columns must be {0,1} if present (after coercion)
     for c in cfg.binary_like:
         if c in df.columns:
@@ -205,11 +208,93 @@ def build_flags(df: pd.DataFrame, cfg: IntegrityConfig) -> pd.DataFrame:
         flags["flag_missing_crt"] = False
         flags["flag_crt_out_of_range"] = False
 
-    # Master flag
-    flag_cols = [c for c in flags.columns if c.startswith("flag_")]
-    flags["any_flag"] = flags[flag_cols].any(axis=1) if flag_cols else False
-
+    # Placeholder; will be set by dupe policy handler
+    flags["flag_duplicate_interaction_id"] = False
     return flags
+
+
+def apply_dupe_policy(
+    df: pd.DataFrame,
+    cfg: IntegrityConfig,
+    dupe_policy: str,
+) -> Tuple[pd.Series, dict]:
+    """
+    Returns:
+      dup_flag_series: bool series aligned to df.index indicating rows to quarantine due to duplicate policy
+      stats: dict with duplicate-related counts for reporting
+
+    Notes:
+    - Only applies if cfg.unique_key exists in df.columns.
+    - Only considers "valid" keys (non-empty, non-unknown).
+    """
+    stats = {
+        "unique_key_present": cfg.unique_key in df.columns,
+        "dupe_policy": dupe_policy,
+        "duplicate_ids_count": 0,
+        "duplicate_rows_involved": 0,
+        "duplicate_rows_removed_extras": 0,
+    }
+
+    if cfg.unique_key not in df.columns:
+        return pd.Series(False, index=df.index), stats
+
+    key_valid = _valid_key_mask(df[cfg.unique_key])
+    if not key_valid.any():
+        return pd.Series(False, index=df.index), stats
+
+    dfx = df.loc[key_valid, [cfg.unique_key] + ([cfg.timestamp_col] if cfg.timestamp_col in df.columns else [])].copy()
+
+    # Identify duplicate groups among valid keys
+    dup_involved = dfx.duplicated(subset=[cfg.unique_key], keep=False)
+    involved_idx = dfx.index[dup_involved]
+
+    stats["duplicate_rows_involved"] = int(len(involved_idx))
+
+    if stats["duplicate_rows_involved"] == 0:
+        return pd.Series(False, index=df.index), stats
+
+    stats["duplicate_ids_count"] = int(dfx.loc[dup_involved, cfg.unique_key].nunique())
+
+    # Policy A: quarantine_all => quarantine all involved rows
+    if dupe_policy == "quarantine_all":
+        out = pd.Series(False, index=df.index)
+        out.loc[involved_idx] = True
+        stats["duplicate_rows_removed_extras"] = stats["duplicate_rows_involved"]
+        return out, stats
+
+    # Policies that quarantine only "extras" and keep one row per duplicated key
+    if dupe_policy in {"quarantine_extras_keep_latest", "quarantine_extras_keep_first"}:
+        # If no timestamp column, fall back to stable index order
+        has_ts = cfg.timestamp_col in df.columns
+
+        if has_ts:
+            # Ensure timestamp is datetime (caller already coerced)
+            dfx[cfg.timestamp_col] = pd.to_datetime(dfx[cfg.timestamp_col], errors="coerce")
+            # Sort per policy
+            ascending = True if dupe_policy == "quarantine_extras_keep_first" else False
+            dfx_sorted = dfx.sort_values([cfg.unique_key, cfg.timestamp_col], ascending=[True, ascending], kind="mergesort")
+        else:
+            # No timestamp: keep_first means lowest index, keep_latest means highest index
+            ascending = True if dupe_policy == "quarantine_extras_keep_first" else False
+            dfx_sorted = dfx.sort_values([cfg.unique_key], kind="mergesort")
+            # Within each key, index order is natural; flip if keeping "latest"
+            if not ascending:
+                dfx_sorted = dfx_sorted.iloc[::-1]
+
+        # Keep one per key (the first row in sorted order), quarantine the rest
+        keeper_idx = dfx_sorted.drop_duplicates(subset=[cfg.unique_key], keep="first").index
+        extras_idx = dfx_sorted.index.difference(keeper_idx)
+
+        out = pd.Series(False, index=df.index)
+        out.loc[extras_idx] = True
+
+        stats["duplicate_rows_removed_extras"] = int(len(extras_idx))
+        return out, stats
+
+    raise ValueError(
+        f"Unknown dupe_policy: {dupe_policy}\n"
+        "Allowed: quarantine_all, quarantine_extras_keep_latest, quarantine_extras_keep_first"
+    )
 
 
 def summarize_flags(flags: pd.DataFrame, n_rows: int) -> dict:
@@ -233,6 +318,7 @@ def run_integrity_gate(
     input_path: Path,
     out_dir: Path,
     cfg: IntegrityConfig,
+    dupe_policy: str,
 ) -> dict:
     df_raw = load_table(input_path)
     df = df_raw.copy()
@@ -250,7 +336,16 @@ def run_integrity_gate(
     if crt_col is not None:
         df[crt_col] = pd.to_numeric(df[crt_col], errors="coerce")
 
+    # Base flags
     flags = build_flags(df, cfg)
+
+    # Apply dupe policy => set duplicate flag
+    dupe_quarantine_mask, dupe_stats = apply_dupe_policy(df, cfg, dupe_policy=dupe_policy)
+    flags["flag_duplicate_interaction_id"] = dupe_quarantine_mask
+
+    # Master flag
+    flag_cols = [c for c in flags.columns if c.startswith("flag_")]
+    flags["any_flag"] = flags[flag_cols].any(axis=1) if flag_cols else False
 
     clean_df = df.loc[~flags["any_flag"]].copy()
     quarantine_df = df.loc[flags["any_flag"]].copy()
@@ -280,6 +375,8 @@ def run_integrity_gate(
         "required_columns": list(cfg.required_columns),
         "binary_like_columns": list(cfg.binary_like),
         "unique_key": cfg.unique_key,
+        # dupe stats
+        **dupe_stats,
     })
 
     save_json(summary_path, summary)
@@ -302,6 +399,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--crt_min", type=float, default=0.0, help="CRT sanity minimum (seconds).")
     p.add_argument("--crt_max", type=float, default=6 * 60 * 60, help="CRT sanity maximum (seconds).")
+
+    p.add_argument(
+        "--dupe_policy",
+        default="quarantine_all",
+        choices=["quarantine_all", "quarantine_extras_keep_latest", "quarantine_extras_keep_first"],
+        help="How to handle duplicate interaction_id values.",
+    )
     return p
 
 
@@ -324,7 +428,12 @@ def main() -> int:
         crt_max_seconds=float(args.crt_max),
     )
 
-    result = run_integrity_gate(input_path=input_path, out_dir=out_dir, cfg=cfg)
+    result = run_integrity_gate(
+        input_path=input_path,
+        out_dir=out_dir,
+        cfg=cfg,
+        dupe_policy=args.dupe_policy,
+    )
 
     s = result["summary"]
     print("INTEGRITY CONTROL LAYER — COMPLETE")
@@ -337,6 +446,12 @@ def main() -> int:
     if s.get("crt_detected_column"):
         print(f"CRT column detected: {s['crt_detected_column']}")
         print(f"CRT sanity range:    {s['crt_sanity_min_seconds']}..{s['crt_sanity_max_seconds']} seconds")
+    print("")
+    print("Duplicate handling:")
+    print(f"- dupe_policy:                 {s.get('dupe_policy')}")
+    print(f"- duplicate_ids_count:         {s.get('duplicate_ids_count')}")
+    print(f"- duplicate_rows_involved:     {s.get('duplicate_rows_involved')}")
+    print(f"- duplicate_rows_removed_extras:{s.get('duplicate_rows_removed_extras')}")
     print("")
     print("Wrote artifacts to /output:")
     print(f"- {Path(s['output_clean']).name}")
