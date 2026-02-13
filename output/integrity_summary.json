@@ -1,0 +1,84 @@
+{
+  "rows_total": 10000,
+  "rows_flagged": 2055,
+  "rows_clean": 7945,
+  "quarantine_rate": 0.2055,
+  "top_flag_rates": [
+    {
+      "flag": "flag_duplicate_interaction_id",
+      "rate": 0.2055
+    },
+    {
+      "flag": "flag_missing_required_column",
+      "rate": 0.0
+    },
+    {
+      "flag": "flag_missing_timestamp",
+      "rate": 0.0
+    },
+    {
+      "flag": "flag_missing_customer_phone",
+      "rate": 0.0
+    },
+    {
+      "flag": "flag_bad_timestamp_parse",
+      "rate": 0.0
+    },
+    {
+      "flag": "flag_nonbinary_callback_flag",
+      "rate": 0.0
+    },
+    {
+      "flag": "flag_nonbinary_cleanup_flag",
+      "rate": 0.0
+    },
+    {
+      "flag": "flag_nonbinary_port_out_flag",
+      "rate": 0.0
+    },
+    {
+      "flag": "flag_missing_crt",
+      "rate": 0.0
+    },
+    {
+      "flag": "flag_crt_out_of_range",
+      "rate": 0.0
+    }
+  ],
+  "all_flag_rates": {
+    "flag_missing_required_column": 0.0,
+    "flag_missing_timestamp": 0.0,
+    "flag_missing_customer_phone": 0.0,
+    "flag_bad_timestamp_parse": 0.0,
+    "flag_nonbinary_callback_flag": 0.0,
+    "flag_nonbinary_cleanup_flag": 0.0,
+    "flag_nonbinary_port_out_flag": 0.0,
+    "flag_missing_crt": 0.0,
+    "flag_crt_out_of_range": 0.0,
+    "flag_duplicate_interaction_id": 0.2055
+  },
+  "timestamp": "2026-02-13 13:36:32",
+  "input_file": "novawireless_synthetic_calls.csv",
+  "output_clean": "calls_clean.csv",
+  "output_quarantine": "calls_quarantine.csv",
+  "output_flags": "integrity_flags.csv",
+  "crt_detected_column": "CRT_seconds",
+  "crt_sanity_min_seconds": 0.0,
+  "crt_sanity_max_seconds": 21600.0,
+  "required_columns": [
+    "timestamp",
+    "customer_phone"
+  ],
+  "binary_like_columns": [
+    "callback_flag",
+    "cleanup_flag",
+    "port_out_flag",
+    "flag_30DACC"
+  ],
+  "unique_key": "interaction_id",
+  "unique_key_present": true,
+  "dupe_policy": "quarantine_all",
+  "duplicate_ids_count": 1004,
+  "duplicate_rows_involved": 2055,
+  "duplicate_rows_removed_extras": 2055
+}
